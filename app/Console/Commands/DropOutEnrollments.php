@@ -67,41 +67,56 @@ class DropOutEnrollments extends Command
      */
     private function dropOutEnrollmentsBefore(Carbon $deadline)
     {
-        $enrollmentsToBeDroppedOut = Enrollment::where('deadline_at', '<=', $deadline)->get();
+        $initialEnrollmentsToBeDroppedOut = Enrollment::where('enrollments.deadline_at', '<=', $deadline);
+        $initialEnrollmentsToBeDroppedOutCount = $initialEnrollmentsToBeDroppedOut->count();
 
-        $this->info('Enrollments to be dropped out: ' . count($enrollmentsToBeDroppedOut));
-        $droppedOutEnrollments = 0;
+        $this->info('Enrollments to be dropped out: ' . $initialEnrollmentsToBeDroppedOutCount);
 
-        foreach ($enrollmentsToBeDroppedOut as $enrollment) {
-            $hasActiveExam = Exam::where('course_id', $enrollment->course_id)
-                ->where('student_id', $enrollment->student_id)
-                ->where('status', 'IN_PROGRESS')
-                ->exists();
+        $batchSize = 500;
+        $enrollmentsToBeDroppedOutCount = 0;
+        $now = now();
+        $initialEnrollmentsToBeDroppedOut
+            ->leftJoin('exams', function ($join) {
+                $join->on('enrollments.course_id', '=', 'exams.course_id')
+                    ->on('enrollments.student_id', '=', 'exams.student_id')
+                    ->where('exams.status', 'IN_PROGRESS');
+            })
+            ->leftJoin('submissions', function ($join) {
+                $join->on('enrollments.course_id', '=', 'submissions.course_id')
+                    ->on('enrollments.student_id', '=', 'submissions.student_id')
+                    ->where('submissions.status', 'WAITING_REVIEW');
+            })
+            ->whereNull('exams.id')
+            ->whereNull('submissions.id')
+            ->selectRaw('DISTINCT enrollments.id, enrollments.student_id')
+            ->orderBy('enrollments.id')
+            ->chunkById($batchSize, function ($enrollments) use (&$enrollmentsToBeDroppedOutCount, $now) {
+                $ids = [];
+                $activities = [];
 
-            $hasWaitingReviewSubmission = Submission::where('course_id', $enrollment->course_id)
-                ->where('student_id', $enrollment->student_id)
-                ->where('status', 'WAITING_REVIEW')
-                ->exists();
+                foreach ($enrollments as $enrollment) {
+                    $ids[] = $enrollment->id;
+                    $activities[] = [
+                        'resource_id' => $enrollment->id,
+                        'user_id' => $enrollment->student_id,
+                        'description' => 'COURSE_DROPOUT',
+                    ];
+                }
 
-            if ($hasActiveExam || $hasWaitingReviewSubmission) {
-                continue;
-            }
+                Enrollment::whereIn('id', $ids)->update([
+                    'status' => 'DROPOUT',
+                    'updated_at' => $now,
+                ]);
 
-            $enrollment->update([
-                'status' => 'DROPOUT',
-                'updated_at' => now(),
-            ]);
+                Activity::insert($activities);
+                $enrollmentsToBeDroppedOutCount += count($activities);
 
-            Activity::create([
-                'resource_id' => $enrollment->id,
-                'user_id' => $enrollment->student_id,
-                'description' => 'COURSE_DROPOUT',
-            ]);
+                unset($ids, $activities);
+                gc_collect_cycles();
+            }, 'enrollments.id', 'id');
 
-            $droppedOutEnrollments++;
-        }
-
-        $this->info('Excluded from drop out: ' . count($enrollmentsToBeDroppedOut) - $droppedOutEnrollments);
-        $this->info('Final dropped out enrollments: ' . $droppedOutEnrollments);
+        $this->info('Excluded from drop out: ' . $initialEnrollmentsToBeDroppedOutCount - $enrollmentsToBeDroppedOutCount);
+        $this->info('Final dropped out enrollments: ' . $enrollmentsToBeDroppedOutCount);
     }
+
 }
